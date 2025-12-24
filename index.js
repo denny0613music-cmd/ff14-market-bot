@@ -1,239 +1,207 @@
 import 'dotenv/config';
+import fs from 'fs';
 import http from 'http';
 import fetch from 'node-fetch';
 import {
   Client,
   GatewayIntentBits,
   SlashCommandBuilder,
-  ContextMenuCommandBuilder,
-  ApplicationCommandType,
   Routes,
-  EmbedBuilder,
-  ActionRowBuilder,
-  StringSelectMenuBuilder
+  EmbedBuilder
 } from 'discord.js';
 import { REST } from '@discordjs/rest';
 
-/* ===============================
-   Render HTTP server
-================================ */
+/* =====================
+   HTTP SERVER（Render 必要）
+===================== */
 const PORT = process.env.PORT || 10000;
-http.createServer((_, res) => {
+http.createServer((req, res) => {
   res.writeHead(200);
-  res.end('OK');
-}).listen(PORT);
+  res.end('FF14 Market Bot Alive');
+}).listen(PORT, () => {
+  console.log(`HTTP server listening on ${PORT}`);
+});
 
-/* ===============================
+/* =====================
+   載入物品 JSON（一次）
+===================== */
+console.log('📦 Loading items_zh.json...');
+const ITEMS = JSON.parse(fs.readFileSync('./items_zh.json', 'utf8'));
+console.log(`✅ Loaded ${ITEMS.length} items`);
+
+/* =====================
+   建立搜尋索引
+===================== */
+const SEARCH_INDEX = ITEMS.map(i => ({
+  id: i.id,
+  zh: i.zh?.toLowerCase() || '',
+  en: i.en?.toLowerCase() || ''
+}));
+
+function findItem(keyword) {
+  const key = keyword.toLowerCase().trim();
+
+  // 1️⃣ 完全命中
+  let exact = SEARCH_INDEX.find(
+    i => i.zh === key || i.en === key
+  );
+  if (exact) return exact;
+
+  // 2️⃣ 模糊包含
+  let fuzzy = SEARCH_INDEX.find(
+    i => i.zh.includes(key) || i.en.includes(key)
+  );
+  if (fuzzy) return fuzzy;
+
+  return null;
+}
+
+/* =====================
+   快取（10 分鐘）
+===================== */
+const CACHE_TTL = 10 * 60 * 1000;
+const priceCache = new Map();
+
+/* =====================
+   繁中服清單
+===================== */
+const ZH_WORLDS = [
+  'Bahamut',
+  'Tonberry',
+  'Typhon',
+  'Kujata',
+  'Garuda',
+  'Ifrit',
+  'Ramuh',
+  'Ultima',
+  'Valefor',
+  'Tiamat',
+  'Shinryu'
+];
+
+/* =====================
    Discord Client
-================================ */
+===================== */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds]
 });
 
-/* ===============================
-   常數
-================================ */
-const DATA_CENTER = '陸行鳥';
-const ITEMS = [];
-let ITEMS_READY = false;
-
-/* ===============================
-   載入所有物品（中英）
-================================ */
-async function loadItems() {
-  console.log('⏳ Loading items from XIVAPI...');
-  let page = 1;
-
-  while (true) {
-    const url = `https://xivapi.com/Item?language=zh&limit=500&page=${page}`;
-    const res = await fetch(url);
-    const json = await res.json();
-
-    for (const item of json.Results) {
-      ITEMS.push({
-        id: item.ID,
-        zh: item.Name,
-        en: item.Name_en
-      });
-    }
-
-    if (!json.Pagination.PageNext) break;
-    page++;
-  }
-
-  ITEMS_READY = true;
-  console.log(`✅ Loaded ${ITEMS.length} items`);
-}
-
-/* ===============================
-   模糊搜尋（最多 25）
-================================ */
-function searchItems(keyword) {
-  const key = keyword.toLowerCase();
-  return ITEMS.filter(i =>
-    i.zh?.includes(keyword) ||
-    i.en?.toLowerCase().includes(key)
-  ).slice(0, 25);
-}
-
-/* ===============================
-   查 Universalis
-================================ */
-async function fetchMarket(itemId) {
-  const url = `https://universalis.app/api/v2/${DATA_CENTER}/${itemId}?listings=5`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('Universalis error');
-  return res.json();
-}
-
-/* ===============================
-   Commands
-================================ */
-const priceCmd = new SlashCommandBuilder()
+/* =====================
+   Slash 指令
+===================== */
+const command = new SlashCommandBuilder()
   .setName('price')
-  .setDescription('查詢 FF14 市價')
+  .setDescription('查詢 FF14 繁中服市價（支援中英模糊搜尋）')
   .addStringOption(opt =>
     opt.setName('item')
-      .setDescription('物品名稱')
+      .setDescription('物品名稱（可只打部分）')
       .setRequired(true)
   );
 
-const contextCmd = new ContextMenuCommandBuilder()
-  .setName('查詢 FF14 市價')
-  .setType(ApplicationCommandType.Message);
-
+/* =====================
+   註冊指令（只做一次）
+===================== */
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+await rest.put(
+  Routes.applicationCommands(process.env.CLIENT_ID),
+  { body: [command.toJSON()] }
+);
+console.log('✅ Slash command registered');
 
-/* ===============================
-   Ready
-================================ */
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  await loadItems();
+/* =====================
+   查價（繁中服彙總）
+===================== */
+async function fetchPrice(itemId) {
+  const cacheKey = String(itemId);
+  const now = Date.now();
 
-  await rest.put(
-    Routes.applicationGuildCommands(
-      process.env.CLIENT_ID,
-      process.env.GUILD_ID
-    ),
-    { body: [priceCmd.toJSON(), contextCmd.toJSON()] }
-  );
-
-  console.log('✅ Commands registered');
-});
-
-/* ===============================
-   Interaction
-================================ */
-client.on('interactionCreate', async interaction => {
-  /* ---------- Slash / Context 共用 ---------- */
-  let keyword = null;
-
-  if (interaction.isChatInputCommand() && interaction.commandName === 'price') {
-    keyword = interaction.options.getString('item').trim();
+  if (priceCache.has(cacheKey)) {
+    const c = priceCache.get(cacheKey);
+    if (c.expires > now) return { ...c.data, cached: true };
   }
 
-  if (interaction.isMessageContextMenuCommand()) {
-    keyword = interaction.targetMessage.content.trim();
+  let prices = [];
+  let lastSales = [];
+
+  for (const world of ZH_WORLDS) {
+    try {
+      const url = `https://universalis.app/api/${world}/${itemId}?listings=1&entries=1`;
+      const res = await fetch(url);
+      if (!res.ok) continue;
+      const data = await res.json();
+
+      if (data.listings?.length) {
+        prices.push(data.listings[0].pricePerUnit);
+      }
+      if (data.recentHistory?.length) {
+        lastSales.push(data.recentHistory[0].pricePerUnit);
+      }
+    } catch {}
   }
 
-  if (!keyword) return;
+  if (!prices.length) return null;
 
-  try {
-    await interaction.deferReply();
-  } catch {
-    return;
-  }
+  const result = {
+    min: Math.min(...prices),
+    avg: Math.round(prices.reduce((a, b) => a + b, 0) / prices.length),
+    last: lastSales[0] || prices[0],
+    cached: false
+  };
 
-  if (!ITEMS_READY) {
-    return interaction.editReply('⏳ 物品資料載入中，請稍後再試');
-  }
+  priceCache.set(cacheKey, {
+    data: result,
+    expires: now + CACHE_TTL
+  });
 
-  const matches = searchItems(keyword);
-
-  if (matches.length === 0) {
-    return interaction.editReply(`❌ 找不到符合「${keyword}」的物品`);
-  }
-
-  /* ---------- 多結果 → 下拉選單 ---------- */
-  if (matches.length > 1) {
-    const menu = new StringSelectMenuBuilder()
-      .setCustomId('select_item')
-      .setPlaceholder('請選擇物品')
-      .addOptions(
-        matches.map(i => ({
-          label: i.zh,
-          description: i.en,
-          value: String(i.id)
-        }))
-      );
-
-    return interaction.editReply({
-      content: '🔍 找到多個物品，請選擇：',
-      components: [new ActionRowBuilder().addComponents(menu)]
-    });
-  }
-
-  /* ---------- 單一結果 ---------- */
-  await sendPrice(interaction, matches[0]);
-});
-
-/* ===============================
-   下拉選單
-================================ */
-client.on('interactionCreate', async interaction => {
-  if (!interaction.isStringSelectMenu()) return;
-  if (interaction.customId !== 'select_item') return;
-
-  try {
-    await interaction.deferUpdate();
-  } catch {
-    return;
-  }
-
-  const itemId = interaction.values[0];
-  const item = ITEMS.find(i => String(i.id) === itemId);
-  if (!item) return;
-
-  await sendPrice(interaction, item, true);
-});
-
-/* ===============================
-   發送價格
-================================ */
-async function sendPrice(interaction, item, isUpdate = false) {
-  try {
-    const data = await fetchMarket(item.id);
-    const prices = data.listings.map(l => l.pricePerUnit);
-
-    const embed = new EmbedBuilder()
-      .setTitle(`📦 ${item.zh}`)
-      .setDescription(`${item.en}\n資料中心：${DATA_CENTER}`)
-      .addFields(
-        { name: '最低價', value: `${Math.min(...prices)} Gil`, inline: true },
-        {
-          name: '平均價',
-          value: `${Math.round(prices.reduce((a, b) => a + b) / prices.length)} Gil`,
-          inline: true
-        }
-      )
-      .setFooter({ text: '資料來源：Universalis' });
-
-    const payload = { embeds: [embed], components: [] };
-
-    if (isUpdate) {
-      await interaction.editReply(payload);
-    } else {
-      await interaction.editReply(payload);
-    }
-
-  } catch (err) {
-    console.error(err);
-    await interaction.editReply('❌ 查詢失敗');
-  }
+  return result;
 }
 
-/* ===============================
-   Login
-================================ */
+/* =====================
+   Interaction 處理（防 10062）
+===================== */
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isChatInputCommand()) return;
+  if (interaction.commandName !== 'price') return;
+
+  try {
+    if (!interaction.deferred && !interaction.replied) {
+      await interaction.deferReply({ ephemeral: false });
+    }
+
+    const keyword = interaction.options.getString('item');
+    const item = findItem(keyword);
+
+    if (!item) {
+      return interaction.editReply(`❌ 找不到符合「${keyword}」的物品`);
+    }
+
+    const price = await fetchPrice(item.id);
+    if (!price) {
+      return interaction.editReply('❌ 此物品在繁中服沒有市場資料');
+    }
+
+    const embed = new EmbedBuilder()
+      .setTitle(`📦 ${item.zh || item.en}`)
+      .addFields(
+        { name: '最低價', value: `${price.min.toLocaleString()} Gil`, inline: true },
+        { name: '平均價', value: `${price.avg.toLocaleString()} Gil`, inline: true },
+        { name: '最近成交', value: `${price.last.toLocaleString()} Gil`, inline: true }
+      )
+      .setFooter({
+        text: price.cached ? '⚡ 快取資料（10 分鐘）' : '🌐 即時查詢'
+      });
+
+    await interaction.editReply({ embeds: [embed] });
+
+  } catch (err) {
+    console.error('⚠️ interaction error:', err);
+    if (!interaction.replied) {
+      await interaction.reply('❌ 查詢失敗，請再試一次');
+    }
+  }
+});
+
+/* =====================
+   啟動
+===================== */
 client.login(process.env.DISCORD_TOKEN);
