@@ -1,7 +1,21 @@
 import 'dotenv/config';
+import http from 'http';
 import { Client, GatewayIntentBits, SlashCommandBuilder, Routes, EmbedBuilder } from 'discord.js';
 import { REST } from '@discordjs/rest';
 import fetch from 'node-fetch';
+
+/**
+ * ===== Render Web Service 必須開 Port =====
+ * 這個 HTTP server 只為了讓 Render 偵測到服務存活
+ * 不影響 Discord Bot 功能
+ */
+const port = process.env.PORT || 3000;
+http.createServer((req, res) => {
+  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+  res.end('ok');
+}).listen(port, () => {
+  console.log(`HTTP server listening on ${port}`);
+});
 
 // ===== 快取設定（10 分鐘）=====
 const CACHE_TTL = 10 * 60 * 1000;
@@ -61,7 +75,7 @@ async function getPrice(realm, itemId) {
 
   const url = `https://universalis.app/api/zh-TW/realm/${encodeURIComponent(realm)}/${itemId}`;
   const res = await fetch(url);
-  if (!res.ok) throw new Error('API error');
+  if (!res.ok) throw new Error('Universalis API error');
 
   const data = await res.json();
 
@@ -73,7 +87,7 @@ async function getPrice(realm, itemId) {
   return { data, fromCache: false };
 }
 
-// ===== 互動處理 =====
+// ===== Discord 互動處理 =====
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'price') return;
