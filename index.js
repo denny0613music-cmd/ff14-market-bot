@@ -5,7 +5,7 @@ import { REST } from '@discordjs/rest';
 import fetch from 'node-fetch';
 
 /**
- * ===== Render Web Service 必須開 Port =====
+ * ===== Render Web Service 必須開 Port（保活用）=====
  */
 const port = process.env.PORT || 3000;
 http.createServer((req, res) => {
@@ -16,16 +16,30 @@ http.createServer((req, res) => {
 });
 
 /**
- * ===== 設定區 =====
+ * ===== 固定查「陸行鳥（繁中服）」=====
+ * Universalis 的 DC 名稱就叫「陸行鳥」
  */
-const DEFAULT_DC = process.env.DEFAULT_DC || 'Meteor';
-const DEFAULT_WORLD = process.env.DEFAULT_WORLD || 'Tonberry';
+const TCHW_DC = '陸行鳥';
 
-// 快取 TTL
+/**
+ * ===== 快取 & 併發去重 =====
+ */
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 分鐘
-// 同一 key 併發去重：同時間很多人查同一個物品，只打一次 API
-const inflight = new Map(); // key -> Promise
 const cache = new Map();    // key -> { expiresAt, value }
+const inflight = new Map(); // key -> Promise
+
+function getCache(key) {
+  const hit = cache.get(key);
+  if (!hit) return null;
+  if (Date.now() > hit.expiresAt) {
+    cache.delete(key);
+    return null;
+  }
+  return hit.value;
+}
+function setCache(key, value) {
+  cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
+}
 
 /**
  * ===== Discord Client =====
@@ -33,28 +47,15 @@ const cache = new Map();    // key -> { expiresAt, value }
 const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 
 /**
- * ===== Slash Command：/price item world? dc?
- * item: 物品名稱（中文/英文都可）
- * world: 可選，預設 DEFAULT_WORLD
- * dc: 可選，預設 DEFAULT_DC
+ * ===== Slash 指令：/price item =====
  */
 const command = new SlashCommandBuilder()
   .setName('price')
-  .setDescription('查詢 FF14 市場價格（Universalis）')
+  .setDescription('查詢 FF14 繁中服（陸行鳥）市場價格（Universalis）')
   .addStringOption(opt =>
     opt.setName('item')
-      .setDescription('物品名稱（例：亞拉戈白金幣 / Grade 8 Tincture）')
+      .setDescription('物品名稱（中文/英文都可）')
       .setRequired(true)
-  )
-  .addStringOption(opt =>
-    opt.setName('world')
-      .setDescription(`伺服器（預設：${DEFAULT_WORLD}）`)
-      .setRequired(false)
-  )
-  .addStringOption(opt =>
-    opt.setName('dc')
-      .setDescription(`資料中心（預設：${DEFAULT_DC}）`)
-      .setRequired(false)
   );
 
 /**
@@ -64,7 +65,6 @@ const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-
   try {
     await rest.put(
       Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
@@ -77,125 +77,104 @@ client.once('ready', async () => {
 });
 
 /**
- * ===== 小工具：快取 / 併發去重 =====
- */
-function getCache(key) {
-  const hit = cache.get(key);
-  if (!hit) return null;
-  if (Date.now() > hit.expiresAt) {
-    cache.delete(key);
-    return null;
-  }
-  return hit.value;
-}
-
-function setCache(key, value) {
-  cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
-}
-
-/**
- * ===== 1) 物品名稱 -> itemId
- * 用 Universalis 的 v2 marketable endpoint 找 itemId
- * q 會走全文搜尋；如果同名很多，取第一個最貼近的
+ * ===== 物品名稱 -> itemId（Universalis marketable v2 search）=====
  */
 async function resolveItemIdByName(itemName) {
   const q = itemName.trim();
-  const url = `https://universalis.app/api/v2/marketable?search=${encodeURIComponent(q)}&limit=8`;
+  const url = `https://universalis.app/api/v2/marketable?search=${encodeURIComponent(q)}&limit=10`;
 
   const res = await fetch(url);
   if (!res.ok) throw new Error(`resolveItemId failed: ${res.status}`);
 
   const data = await res.json();
-
-  // data.results: [{ itemId, itemName, ... }]
   const results = data?.results || [];
   if (!results.length) return null;
 
-  // 優先：完全相同（忽略大小寫 / 全形空白）
-  const norm = (s) => s.replace(/\s+/g, '').toLowerCase();
+  // 盡量挑「完全相符」(忽略空白/大小寫)，不然用第一筆
+  const norm = (s) => (s || '').replace(/\s+/g, '').toLowerCase();
   const target = norm(q);
 
-  let best = results.find(r => norm(r.itemName || '') === target);
+  let best = results.find(r => norm(r.itemName) === target);
   if (!best) best = results[0];
 
-  return {
-    itemId: best.itemId,
-    itemName: best.itemName || q
-  };
+  return { itemId: best.itemId, itemName: best.itemName || q };
 }
 
 /**
- * ===== 2) 查市場：最低 / 平均 / 最近成交 =====
- * - world：使用 /api/v2/{world}/{itemId}
- * - recentHistory: 最近成交紀錄
+ * ===== 查 DC 聚合市場（陸行鳥）=====
+ * v2: /api/v2/{dc}/{itemId}
  */
-async function fetchMarketStats(world, itemId) {
-  const url = `https://universalis.app/api/v2/${encodeURIComponent(world)}/${itemId}?listings=10&entries=10`;
+async function fetchDcMarket(dcName, itemId) {
+  const url = `https://universalis.app/api/v2/${encodeURIComponent(dcName)}/${itemId}?listings=20&entries=20`;
   const res = await fetch(url);
   if (!res.ok) throw new Error(`market fetch failed: ${res.status}`);
   return res.json();
 }
 
 /**
- * ===== 主流程：名稱查詢 + 統計 =====
+ * ===== 從 DC 資料算出：最低/平均/最近成交 + 最便宜伺服器 =====
  */
-async function queryPrice({ item, world }) {
-  const key = `price:${world}:${item}`.toLowerCase();
+function computeStats(dcMarketJson) {
+  const listings = Array.isArray(dcMarketJson.listings) ? dcMarketJson.listings : [];
+  const history = Array.isArray(dcMarketJson.recentHistory) ? dcMarketJson.recentHistory : [];
 
-  // 快取命中
+  // 最低價（Universalis listings 通常已依價排序）
+  const lowestListing = listings.length ? listings[0] : null;
+  const lowest = lowestListing?.pricePerUnit ?? null;
+  const cheapestWorld = lowestListing?.worldName || lowestListing?.world || null;
+
+  // 平均價：優先用最近成交 history（最多 20 筆），沒有再用掛單平均
+  let avg = null;
+  if (history.length) {
+    const units = history.map(h => h.pricePerUnit).filter(n => Number.isFinite(n));
+    if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
+  } else if (listings.length) {
+    const units = listings.map(l => l.pricePerUnit).filter(n => Number.isFinite(n));
+    if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
+  }
+
+  // 最近成交（最新一筆）
+  let lastSale = null;
+  if (history.length) {
+    const h = history[0];
+    lastSale = {
+      pricePerUnit: h.pricePerUnit,
+      quantity: h.quantity,
+      timestamp: h.timestamp
+    };
+  }
+
+  return { lowest, cheapestWorld, avg, lastSale };
+}
+
+/**
+ * ===== 主查詢：名稱 -> itemId -> 陸行鳥 DC 市場 -> 統計 =====
+ */
+async function queryTchwPrice(itemName) {
+  const key = `tchw:${itemName}`.toLowerCase();
+
   const cached = getCache(key);
   if (cached) return { ...cached, fromCache: true };
 
-  // 併發去重
   if (inflight.has(key)) {
     const v = await inflight.get(key);
     return { ...v, fromCache: true, sharedInflight: true };
   }
 
   const p = (async () => {
-    // 先把名稱轉 itemId
-    const resolved = await resolveItemIdByName(item);
-    if (!resolved) {
-      return { ok: false, reason: 'not_found' };
-    }
+    const resolved = await resolveItemIdByName(itemName);
+    if (!resolved) return { ok: false, reason: 'not_found' };
 
-    const market = await fetchMarketStats(world, resolved.itemId);
-
-    const listings = Array.isArray(market.listings) ? market.listings : [];
-    const history = Array.isArray(market.recentHistory) ? market.recentHistory : [];
-
-    const lowest = listings.length ? listings[0].pricePerUnit : null;
-
-    // 平均：用最近成交（entries=10），如果沒有就用 listings 的平均
-    let avg = null;
-    if (history.length) {
-      const units = history.map(h => h.pricePerUnit).filter(n => Number.isFinite(n));
-      if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
-    } else if (listings.length) {
-      const units = listings.map(l => l.pricePerUnit).filter(n => Number.isFinite(n));
-      if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
-    }
-
-    // 最近成交：取最新 1 筆
-    let lastSale = null;
-    if (history.length) {
-      // Universalis recentHistory 通常已按時間新->舊
-      const h = history[0];
-      lastSale = {
-        pricePerUnit: h.pricePerUnit,
-        quantity: h.quantity,
-        timestamp: h.timestamp
-      };
-    }
+    const market = await fetchDcMarket(TCHW_DC, resolved.itemId);
+    const stats = computeStats(market);
 
     const result = {
       ok: true,
-      world,
+      dc: TCHW_DC,
       itemId: resolved.itemId,
-      itemName: resolved.itemName || item,
-      lowest,
-      avg,
-      lastSale,
+      itemName: resolved.itemName || itemName,
+      ...stats,
+      // 上傳時間（可有可無）
       updated: market.lastUploadTime ? new Date(market.lastUploadTime).toISOString() : null,
     };
 
@@ -204,7 +183,6 @@ async function queryPrice({ item, world }) {
   })();
 
   inflight.set(key, p);
-
   try {
     const v = await p;
     return { ...v, fromCache: false };
@@ -223,44 +201,50 @@ client.on('interactionCreate', async (interaction) => {
   await interaction.deferReply();
 
   const item = interaction.options.getString('item');
-  const world = interaction.options.getString('world') || DEFAULT_WORLD;
-  // dc 先保留（你要跨 DC 查我可以下一步做），目前查 world 就夠用
-  // const dc = interaction.options.getString('dc') || DEFAULT_DC;
 
   try {
-    const r = await queryPrice({ item, world });
+    const r = await queryTchwPrice(item);
 
     if (!r.ok) {
       if (r.reason === 'not_found') {
-        return interaction.editReply(`❌ 找不到物品：**${item}**（請換更完整名字或改用英文）`);
+        return interaction.editReply(`❌ 找不到物品：**${item}**（建議輸入更完整名稱，或改用英文）`);
       }
       return interaction.editReply('❌ 查詢失敗，請稍後再試');
     }
 
     const embed = new EmbedBuilder()
       .setTitle(`📦 ${r.itemName}`)
-      .setDescription(`World：**${r.world}**  ｜  Item ID：\`${r.itemId}\``)
+      .setDescription(`範圍：**${r.dc}（繁中服）** ｜ Item ID：\`${r.itemId}\``)
       .addFields(
-        { name: '最低單價', value: r.lowest ? `${r.lowest.toLocaleString()} Gil` : '（無掛單）', inline: true },
-        { name: '平均單價', value: r.avg ? `${r.avg.toLocaleString()} Gil` : '（無資料）', inline: true }
+        {
+          name: '最低單價（全繁中服）',
+          value: r.lowest
+            ? `${r.lowest.toLocaleString()} Gil${r.cheapestWorld ? `（最便宜：**${r.cheapestWorld}**）` : ''}`
+            : '（無掛單）',
+          inline: false
+        },
+        {
+          name: '平均單價',
+          value: r.avg ? `${r.avg.toLocaleString()} Gil` : '（無資料）',
+          inline: true
+        }
       );
 
     if (r.lastSale) {
       const ts = r.lastSale.timestamp ? `<t:${r.lastSale.timestamp}:R>` : '';
       embed.addFields({
         name: '最近成交',
-        value: `${r.lastSale.pricePerUnit.toLocaleString()} Gil × ${r.lastSale.quantity}  ${ts}`.trim(),
-        inline: false
+        value: `${r.lastSale.pricePerUnit.toLocaleString()} Gil × ${r.lastSale.quantity} ${ts}`.trim(),
+        inline: true
       });
     } else {
-      embed.addFields({ name: '最近成交', value: '（無資料）', inline: false });
+      embed.addFields({ name: '最近成交', value: '（無資料）', inline: true });
     }
 
     const foot = [];
-    if (r.fromCache) foot.push('⚡ 快取');
-    else foot.push('🌐 即時');
+    foot.push(r.fromCache ? '⚡ 快取' : '🌐 即時');
     if (r.sharedInflight) foot.push('併發合併');
-    foot.push(`TTL 10 分鐘`);
+    foot.push('TTL 10 分鐘');
     embed.setFooter({ text: foot.join(' ｜ ') });
 
     await interaction.editReply({ embeds: [embed] });
