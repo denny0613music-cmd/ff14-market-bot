@@ -5,13 +5,17 @@ import {
   Client,
   GatewayIntentBits,
   SlashCommandBuilder,
+  ContextMenuCommandBuilder,
+  ApplicationCommandType,
   Routes,
-  EmbedBuilder
+  EmbedBuilder,
+  ActionRowBuilder,
+  StringSelectMenuBuilder
 } from 'discord.js';
 import { REST } from '@discordjs/rest';
 
 /* ===============================
-   Render HTTP Server
+   Render HTTP server
 ================================ */
 const PORT = process.env.PORT || 10000;
 http.createServer((_, res) => {
@@ -30,14 +34,14 @@ const client = new Client({
    常數
 ================================ */
 const DATA_CENTER = '陸行鳥';
-const ITEM_CACHE = new Map();
+const ITEMS = [];
 let ITEMS_READY = false;
 
 /* ===============================
-   下載完整物品清單（啟動一次）
+   載入所有物品（中英）
 ================================ */
 async function loadItems() {
-  console.log('⏳ Loading item list from XIVAPI...');
+  console.log('⏳ Loading items from XIVAPI...');
   let page = 1;
 
   while (true) {
@@ -46,7 +50,7 @@ async function loadItems() {
     const json = await res.json();
 
     for (const item of json.Results) {
-      ITEM_CACHE.set(item.ID, {
+      ITEMS.push({
         id: item.ID,
         zh: item.Name,
         en: item.Name_en
@@ -58,27 +62,18 @@ async function loadItems() {
   }
 
   ITEMS_READY = true;
-  console.log(`✅ Loaded ${ITEM_CACHE.size} items`);
+  console.log(`✅ Loaded ${ITEMS.length} items`);
 }
 
 /* ===============================
-   模糊搜尋
+   模糊搜尋（最多 25）
 ================================ */
-function searchItem(keyword) {
+function searchItems(keyword) {
   const key = keyword.toLowerCase();
-  const results = [];
-
-  for (const item of ITEM_CACHE.values()) {
-    if (
-      item.zh?.includes(keyword) ||
-      item.en?.toLowerCase().includes(key)
-    ) {
-      results.push(item);
-      if (results.length >= 5) break;
-    }
-  }
-
-  return results;
+  return ITEMS.filter(i =>
+    i.zh?.includes(keyword) ||
+    i.en?.toLowerCase().includes(key)
+  ).slice(0, 25);
 }
 
 /* ===============================
@@ -92,16 +87,20 @@ async function fetchMarket(itemId) {
 }
 
 /* ===============================
-   Slash 指令
+   Commands
 ================================ */
-const command = new SlashCommandBuilder()
+const priceCmd = new SlashCommandBuilder()
   .setName('price')
-  .setDescription('查詢 FF14 繁中服市價（模糊搜尋）')
+  .setDescription('查詢 FF14 市價')
   .addStringOption(opt =>
     opt.setName('item')
-      .setDescription('物品名稱（可輸入部分）')
+      .setDescription('物品名稱')
       .setRequired(true)
   );
+
+const contextCmd = new ContextMenuCommandBuilder()
+  .setName('查詢 FF14 市價')
+  .setType(ApplicationCommandType.Message);
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
@@ -117,18 +116,28 @@ client.once('ready', async () => {
       process.env.CLIENT_ID,
       process.env.GUILD_ID
     ),
-    { body: [command.toJSON()] }
+    { body: [priceCmd.toJSON(), contextCmd.toJSON()] }
   );
 
-  console.log('✅ Slash command registered');
+  console.log('✅ Commands registered');
 });
 
 /* ===============================
    Interaction
 ================================ */
 client.on('interactionCreate', async interaction => {
-  if (!interaction.isChatInputCommand()) return;
-  if (interaction.commandName !== 'price') return;
+  /* ---------- Slash / Context 共用 ---------- */
+  let keyword = null;
+
+  if (interaction.isChatInputCommand() && interaction.commandName === 'price') {
+    keyword = interaction.options.getString('item').trim();
+  }
+
+  if (interaction.isMessageContextMenuCommand()) {
+    keyword = interaction.targetMessage.content.trim();
+  }
+
+  if (!keyword) return;
 
   try {
     await interaction.deferReply();
@@ -137,35 +146,69 @@ client.on('interactionCreate', async interaction => {
   }
 
   if (!ITEMS_READY) {
-    return interaction.editReply('⏳ 物品資料尚未載入完成');
+    return interaction.editReply('⏳ 物品資料載入中，請稍後再試');
   }
 
-  const keyword = interaction.options.getString('item').trim();
-  const matches = searchItem(keyword);
+  const matches = searchItems(keyword);
 
   if (matches.length === 0) {
     return interaction.editReply(`❌ 找不到符合「${keyword}」的物品`);
   }
 
+  /* ---------- 多結果 → 下拉選單 ---------- */
   if (matches.length > 1) {
-    const list = matches
-      .map(i => `• ${i.zh} / ${i.en}`)
-      .join('\n');
+    const menu = new StringSelectMenuBuilder()
+      .setCustomId('select_item')
+      .setPlaceholder('請選擇物品')
+      .addOptions(
+        matches.map(i => ({
+          label: i.zh,
+          description: i.en,
+          value: String(i.id)
+        }))
+      );
 
     return interaction.editReply({
-      content: `🔍 找到多個物品，請輸入更完整名稱：\n${list}`
+      content: '🔍 找到多個物品，請選擇：',
+      components: [new ActionRowBuilder().addComponents(menu)]
     });
   }
 
-  const item = matches[0];
+  /* ---------- 單一結果 ---------- */
+  await sendPrice(interaction, matches[0]);
+});
 
+/* ===============================
+   下拉選單
+================================ */
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isStringSelectMenu()) return;
+  if (interaction.customId !== 'select_item') return;
+
+  try {
+    await interaction.deferUpdate();
+  } catch {
+    return;
+  }
+
+  const itemId = interaction.values[0];
+  const item = ITEMS.find(i => String(i.id) === itemId);
+  if (!item) return;
+
+  await sendPrice(interaction, item, true);
+});
+
+/* ===============================
+   發送價格
+================================ */
+async function sendPrice(interaction, item, isUpdate = false) {
   try {
     const data = await fetchMarket(item.id);
     const prices = data.listings.map(l => l.pricePerUnit);
 
     const embed = new EmbedBuilder()
       .setTitle(`📦 ${item.zh}`)
-      .setDescription(`(${item.en})`)
+      .setDescription(`${item.en}\n資料中心：${DATA_CENTER}`)
       .addFields(
         { name: '最低價', value: `${Math.min(...prices)} Gil`, inline: true },
         {
@@ -176,13 +219,19 @@ client.on('interactionCreate', async interaction => {
       )
       .setFooter({ text: '資料來源：Universalis' });
 
-    await interaction.editReply({ embeds: [embed] });
+    const payload = { embeds: [embed], components: [] };
+
+    if (isUpdate) {
+      await interaction.editReply(payload);
+    } else {
+      await interaction.editReply(payload);
+    }
 
   } catch (err) {
     console.error(err);
     await interaction.editReply('❌ 查詢失敗');
   }
-});
+}
 
 /* ===============================
    Login
