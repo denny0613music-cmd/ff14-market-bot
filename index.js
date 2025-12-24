@@ -11,15 +11,13 @@ import {
 import { REST } from '@discordjs/rest';
 
 /* ===============================
-   Render 用 HTTP server（必要）
+   Render HTTP Server
 ================================ */
 const PORT = process.env.PORT || 10000;
 http.createServer((_, res) => {
   res.writeHead(200);
-  res.end('FF14 Market Bot Running');
-}).listen(PORT, () => {
-  console.log(`HTTP server listening on ${PORT}`);
-});
+  res.end('OK');
+}).listen(PORT);
 
 /* ===============================
    Discord Client
@@ -29,67 +27,91 @@ const client = new Client({
 });
 
 /* ===============================
-   陸行鳥（繁中）資料中心
+   常數
 ================================ */
-const CHAOS_CH_DATA_CENTER = '陸行鳥';
+const DATA_CENTER = '陸行鳥';
+const ITEM_CACHE = new Map();
+let ITEMS_READY = false;
 
 /* ===============================
-   常用繁中物品 → Item ID（第一批）
-   👉 之後可以一直加
+   下載完整物品清單（啟動一次）
 ================================ */
-const ITEM_MAP = {
-  '亞拉戈白金幣': 10333,
-  '亞拉戈銀幣': 10331,
-  '亞拉戈金幣': 10332,
-  '平紋布': 5333,
-  '棉布': 5329,
-  '絲綢': 5334,
-  '秘銀錠': 5057,
-  '白鋼錠': 5059,
-  '鐵錠': 5055,
-  '硬銀錠': 5060,
-  '魔銀錠': 5061,
-  '暗鋼錠': 5062,
-  '獸脂': 5536,
-  '獸皮': 5529,
-  '硬革': 5533,
-  '秘銀礦': 5107,
-  '白鋼礦': 5109,
-  '暗鋼礦': 5111,
-  '水晶': 2,
-  '火晶': 6,
-  '風晶': 4,
-  '雷晶': 8,
-  '冰晶': 5,
-  '土晶': 7
-};
+async function loadItems() {
+  console.log('⏳ Loading item list from XIVAPI...');
+  let page = 1;
+
+  while (true) {
+    const url = `https://xivapi.com/Item?language=zh&limit=500&page=${page}`;
+    const res = await fetch(url);
+    const json = await res.json();
+
+    for (const item of json.Results) {
+      ITEM_CACHE.set(item.ID, {
+        id: item.ID,
+        zh: item.Name,
+        en: item.Name_en
+      });
+    }
+
+    if (!json.Pagination.PageNext) break;
+    page++;
+  }
+
+  ITEMS_READY = true;
+  console.log(`✅ Loaded ${ITEM_CACHE.size} items`);
+}
 
 /* ===============================
-   快取（10 分鐘）
+   模糊搜尋
 ================================ */
-const CACHE_TTL = 10 * 60 * 1000;
-const cache = new Map();
+function searchItem(keyword) {
+  const key = keyword.toLowerCase();
+  const results = [];
+
+  for (const item of ITEM_CACHE.values()) {
+    if (
+      item.zh?.includes(keyword) ||
+      item.en?.toLowerCase().includes(key)
+    ) {
+      results.push(item);
+      if (results.length >= 5) break;
+    }
+  }
+
+  return results;
+}
+
+/* ===============================
+   查 Universalis
+================================ */
+async function fetchMarket(itemId) {
+  const url = `https://universalis.app/api/v2/${DATA_CENTER}/${itemId}?listings=5`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error('Universalis error');
+  return res.json();
+}
 
 /* ===============================
    Slash 指令
 ================================ */
 const command = new SlashCommandBuilder()
   .setName('price')
-  .setDescription('查詢 FF14 繁中服市場價格')
+  .setDescription('查詢 FF14 繁中服市價（模糊搜尋）')
   .addStringOption(opt =>
-    opt
-      .setName('item')
-      .setDescription('繁中物品名稱（例如：亞拉戈白金幣）')
+    opt.setName('item')
+      .setDescription('物品名稱（可輸入部分）')
       .setRequired(true)
   );
 
 const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
 
 /* ===============================
-   註冊指令（只在啟動時）
+   Ready
 ================================ */
 client.once('ready', async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
+  await loadItems();
+
   await rest.put(
     Routes.applicationGuildCommands(
       process.env.CLIENT_ID,
@@ -97,76 +119,58 @@ client.once('ready', async () => {
     ),
     { body: [command.toJSON()] }
   );
+
   console.log('✅ Slash command registered');
 });
 
 /* ===============================
-   查詢 Universalis（資料中心）
-================================ */
-async function fetchMarket(itemId) {
-  const now = Date.now();
-  if (cache.has(itemId)) {
-    const cached = cache.get(itemId);
-    if (cached.expire > now) return cached.data;
-  }
-
-  const url = `https://universalis.app/api/v2/${encodeURIComponent(
-    CHAOS_CH_DATA_CENTER
-  )}/${itemId}?listings=5`;
-
-  const res = await fetch(url);
-  if (!res.ok) throw new Error('Universalis API error');
-
-  const data = await res.json();
-  cache.set(itemId, { data, expire: now + CACHE_TTL });
-  return data;
-}
-
-/* ===============================
-   Interaction 處理（穩定版）
+   Interaction
 ================================ */
 client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'price') return;
 
   try {
-    await interaction.deferReply({ ephemeral: false });
+    await interaction.deferReply();
   } catch {
-    console.warn('⚠️ deferReply failed');
     return;
   }
 
-  const name = interaction.options.getString('item').trim();
-  const itemId = ITEM_MAP[name];
-
-  if (!itemId) {
-    return interaction.editReply(
-      `❌ 找不到物品：${name}\n請確認名稱是否在支援清單中`
-    );
+  if (!ITEMS_READY) {
+    return interaction.editReply('⏳ 物品資料尚未載入完成');
   }
 
+  const keyword = interaction.options.getString('item').trim();
+  const matches = searchItem(keyword);
+
+  if (matches.length === 0) {
+    return interaction.editReply(`❌ 找不到符合「${keyword}」的物品`);
+  }
+
+  if (matches.length > 1) {
+    const list = matches
+      .map(i => `• ${i.zh} / ${i.en}`)
+      .join('\n');
+
+    return interaction.editReply({
+      content: `🔍 找到多個物品，請輸入更完整名稱：\n${list}`
+    });
+  }
+
+  const item = matches[0];
+
   try {
-    const data = await fetchMarket(itemId);
-
-    if (!data.listings || data.listings.length === 0) {
-      return interaction.editReply('⚠️ 目前市場沒有上架資料');
-    }
-
+    const data = await fetchMarket(item.id);
     const prices = data.listings.map(l => l.pricePerUnit);
-    const min = Math.min(...prices);
-    const avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
 
     const embed = new EmbedBuilder()
-      .setTitle(`📦 ${name}`)
-      .setDescription(`資料中心：${CHAOS_CH_DATA_CENTER}`)
+      .setTitle(`📦 ${item.zh}`)
+      .setDescription(`(${item.en})`)
       .addFields(
-        { name: '最低價', value: `${min.toLocaleString()} Gil`, inline: true },
-        { name: '平均價', value: `${avg.toLocaleString()} Gil`, inline: true },
+        { name: '最低價', value: `${Math.min(...prices)} Gil`, inline: true },
         {
-          name: '最近成交',
-          value: data.recentHistory?.[0]
-            ? `${data.recentHistory[0].pricePerUnit.toLocaleString()} Gil`
-            : '無',
+          name: '平均價',
+          value: `${Math.round(prices.reduce((a, b) => a + b) / prices.length)} Gil`,
           inline: true
         }
       )
@@ -176,11 +180,11 @@ client.on('interactionCreate', async interaction => {
 
   } catch (err) {
     console.error(err);
-    await interaction.editReply('❌ 查詢失敗，請稍後再試');
+    await interaction.editReply('❌ 查詢失敗');
   }
 });
 
 /* ===============================
-   登入
+   Login
 ================================ */
 client.login(process.env.DISCORD_TOKEN);
