@@ -1,277 +1,186 @@
 import 'dotenv/config';
 import http from 'http';
-import { Client, GatewayIntentBits, SlashCommandBuilder, Routes, EmbedBuilder } from 'discord.js';
-import { REST } from '@discordjs/rest';
 import fetch from 'node-fetch';
+import {
+  Client,
+  GatewayIntentBits,
+  SlashCommandBuilder,
+  Routes,
+  EmbedBuilder
+} from 'discord.js';
+import { REST } from '@discordjs/rest';
 
-/**
- * ===== Render Web Service 必須開 Port（保活用）=====
- */
-const port = process.env.PORT || 3000;
-http
-  .createServer((req, res) => {
-    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-    res.end('ok');
-  })
-  .listen(port, () => {
-    console.log(`HTTP server listening on ${port}`);
-  });
-
-/**
- * ===== 固定查「陸行鳥（繁中服）」=====
- * Universalis 的 DC 名稱就叫「陸行鳥」
- */
-const TCHW_DC = '陸行鳥';
-
-/**
- * ===== 快取 & 併發去重 =====
- */
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 分鐘
-const cache = new Map(); // key -> { expiresAt, value }
-const inflight = new Map(); // key -> Promise
-
-function getCache(key) {
-  const hit = cache.get(key);
-  if (!hit) return null;
-  if (Date.now() > hit.expiresAt) {
-    cache.delete(key);
-    return null;
-  }
-  return hit.value;
-}
-function setCache(key, value) {
-  cache.set(key, { value, expiresAt: Date.now() + CACHE_TTL_MS });
-}
-
-/**
- * ===== Discord Client =====
- */
-const client = new Client({ intents: [GatewayIntentBits.Guilds] });
-
-/**
- * ===== Slash 指令：/price item =====
- */
-const command = new SlashCommandBuilder()
-  .setName('price')
-  .setDescription('查詢 FF14 繁中服（陸行鳥）市場價格（Universalis）')
-  .addStringOption((opt) =>
-    opt.setName('item').setDescription('物品名稱（中文/英文都可）').setRequired(true)
-  );
-
-/**
- * ===== 註冊 Slash 指令（Guild 指令，更新快）=====
- */
-const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
-
-client.once('ready', async () => {
-  console.log(`✅ Logged in as ${client.user.tag}`);
-  try {
-    await rest.put(
-      Routes.applicationGuildCommands(process.env.CLIENT_ID, process.env.GUILD_ID),
-      { body: [command.toJSON()] }
-    );
-    console.log('✅ Slash command registered');
-  } catch (err) {
-    console.error('❌ Failed to register command', err);
-  }
+/* ===============================
+   Render 用 HTTP server（必要）
+================================ */
+const PORT = process.env.PORT || 10000;
+http.createServer((_, res) => {
+  res.writeHead(200);
+  res.end('FF14 Market Bot Running');
+}).listen(PORT, () => {
+  console.log(`HTTP server listening on ${PORT}`);
 });
 
-/**
- * ===== 物品名稱 -> itemId（Universalis marketable v2 search）=====
- */
-async function resolveItemIdByName(itemName) {
-  const q = itemName.trim();
-  const url = `https://universalis.app/api/v2/marketable?search=${encodeURIComponent(q)}&limit=10`;
+/* ===============================
+   Discord Client
+================================ */
+const client = new Client({
+  intents: [GatewayIntentBits.Guilds]
+});
+
+/* ===============================
+   陸行鳥（繁中）資料中心
+================================ */
+const CHAOS_CH_DATA_CENTER = '陸行鳥';
+
+/* ===============================
+   常用繁中物品 → Item ID（第一批）
+   👉 之後可以一直加
+================================ */
+const ITEM_MAP = {
+  '亞拉戈白金幣': 10333,
+  '亞拉戈銀幣': 10331,
+  '亞拉戈金幣': 10332,
+  '平紋布': 5333,
+  '棉布': 5329,
+  '絲綢': 5334,
+  '秘銀錠': 5057,
+  '白鋼錠': 5059,
+  '鐵錠': 5055,
+  '硬銀錠': 5060,
+  '魔銀錠': 5061,
+  '暗鋼錠': 5062,
+  '獸脂': 5536,
+  '獸皮': 5529,
+  '硬革': 5533,
+  '秘銀礦': 5107,
+  '白鋼礦': 5109,
+  '暗鋼礦': 5111,
+  '水晶': 2,
+  '火晶': 6,
+  '風晶': 4,
+  '雷晶': 8,
+  '冰晶': 5,
+  '土晶': 7
+};
+
+/* ===============================
+   快取（10 分鐘）
+================================ */
+const CACHE_TTL = 10 * 60 * 1000;
+const cache = new Map();
+
+/* ===============================
+   Slash 指令
+================================ */
+const command = new SlashCommandBuilder()
+  .setName('price')
+  .setDescription('查詢 FF14 繁中服市場價格')
+  .addStringOption(opt =>
+    opt
+      .setName('item')
+      .setDescription('繁中物品名稱（例如：亞拉戈白金幣）')
+      .setRequired(true)
+  );
+
+const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+
+/* ===============================
+   註冊指令（只在啟動時）
+================================ */
+client.once('ready', async () => {
+  console.log(`✅ Logged in as ${client.user.tag}`);
+  await rest.put(
+    Routes.applicationGuildCommands(
+      process.env.CLIENT_ID,
+      process.env.GUILD_ID
+    ),
+    { body: [command.toJSON()] }
+  );
+  console.log('✅ Slash command registered');
+});
+
+/* ===============================
+   查詢 Universalis（資料中心）
+================================ */
+async function fetchMarket(itemId) {
+  const now = Date.now();
+  if (cache.has(itemId)) {
+    const cached = cache.get(itemId);
+    if (cached.expire > now) return cached.data;
+  }
+
+  const url = `https://universalis.app/api/v2/${encodeURIComponent(
+    CHAOS_CH_DATA_CENTER
+  )}/${itemId}?listings=5`;
 
   const res = await fetch(url);
-  if (!res.ok) throw new Error(`resolveItemId failed: ${res.status}`);
+  if (!res.ok) throw new Error('Universalis API error');
 
   const data = await res.json();
-  const results = data?.results || [];
-  if (!results.length) return null;
-
-  // 優先完全相符（忽略空白/大小寫），否則取第一筆
-  const norm = (s) => (s || '').replace(/\s+/g, '').toLowerCase();
-  const target = norm(q);
-
-  let best = results.find((r) => norm(r.itemName) === target);
-  if (!best) best = results[0];
-
-  return { itemId: best.itemId, itemName: best.itemName || q };
+  cache.set(itemId, { data, expire: now + CACHE_TTL });
+  return data;
 }
 
-/**
- * ===== 查 DC 聚合市場（陸行鳥）=====
- * v2: /api/v2/{dc}/{itemId}
- */
-async function fetchDcMarket(dcName, itemId) {
-  const url = `https://universalis.app/api/v2/${encodeURIComponent(dcName)}/${itemId}?listings=20&entries=20`;
-  const res = await fetch(url);
-  if (!res.ok) throw new Error(`market fetch failed: ${res.status}`);
-  return res.json();
-}
-
-/**
- * ===== 從 DC 資料算出：最低/平均/最近成交 + 最便宜伺服器 =====
- */
-function computeStats(dcMarketJson) {
-  const listings = Array.isArray(dcMarketJson.listings) ? dcMarketJson.listings : [];
-  const history = Array.isArray(dcMarketJson.recentHistory) ? dcMarketJson.recentHistory : [];
-
-  const lowestListing = listings.length ? listings[0] : null;
-  const lowest = lowestListing?.pricePerUnit ?? null;
-  const cheapestWorld = lowestListing?.worldName || lowestListing?.world || null;
-
-  // 平均價：優先用最近成交 history（最多 20 筆），沒有再用掛單平均
-  let avg = null;
-  if (history.length) {
-    const units = history.map((h) => h.pricePerUnit).filter((n) => Number.isFinite(n));
-    if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
-  } else if (listings.length) {
-    const units = listings.map((l) => l.pricePerUnit).filter((n) => Number.isFinite(n));
-    if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
-  }
-
-  // 最近成交（最新一筆）
-  let lastSale = null;
-  if (history.length) {
-    const h = history[0];
-    lastSale = {
-      pricePerUnit: h.pricePerUnit,
-      quantity: h.quantity,
-      timestamp: h.timestamp,
-    };
-  }
-
-  return { lowest, cheapestWorld, avg, lastSale };
-}
-
-/**
- * ===== 主查詢：名稱 -> itemId -> 陸行鳥 DC 市場 -> 統計 =====
- */
-async function queryTchwPrice(itemName) {
-  const key = `tchw:${itemName}`.toLowerCase();
-
-  const cached = getCache(key);
-  if (cached) return { ...cached, fromCache: true };
-
-  if (inflight.has(key)) {
-    const v = await inflight.get(key);
-    return { ...v, fromCache: true, sharedInflight: true };
-  }
-
-  const p = (async () => {
-    const resolved = await resolveItemIdByName(itemName);
-    if (!resolved) return { ok: false, reason: 'not_found' };
-
-    const market = await fetchDcMarket(TCHW_DC, resolved.itemId);
-    const stats = computeStats(market);
-
-    const result = {
-      ok: true,
-      dc: TCHW_DC,
-      itemId: resolved.itemId,
-      itemName: resolved.itemName || itemName,
-      ...stats,
-      updated: market.lastUploadTime ? new Date(market.lastUploadTime).toISOString() : null,
-    };
-
-    setCache(key, result);
-    return result;
-  })();
-
-  inflight.set(key, p);
-  try {
-    const v = await p;
-    return { ...v, fromCache: false };
-  } finally {
-    inflight.delete(key);
-  }
-}
-
-/**
- * ===== Discord 互動處理 =====
- */
-client.on('interactionCreate', async (interaction) => {
+/* ===============================
+   Interaction 處理（穩定版）
+================================ */
+client.on('interactionCreate', async interaction => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'price') return;
 
-  // ✅ 防止 Unknown interaction (10062) 直接把程式炸掉
   try {
-    await interaction.deferReply();
-  } catch (err) {
-    console.warn('⚠️ deferReply failed (likely unknown interaction):', err?.code || err);
+    await interaction.deferReply({ ephemeral: false });
+  } catch {
+    console.warn('⚠️ deferReply failed');
     return;
   }
 
-  const item = interaction.options.getString('item');
+  const name = interaction.options.getString('item').trim();
+  const itemId = ITEM_MAP[name];
+
+  if (!itemId) {
+    return interaction.editReply(
+      `❌ 找不到物品：${name}\n請確認名稱是否在支援清單中`
+    );
+  }
 
   try {
-    const r = await queryTchwPrice(item);
+    const data = await fetchMarket(itemId);
 
-    if (!r.ok) {
-      if (r.reason === 'not_found') {
-        return interaction.editReply(`❌ 找不到物品：**${item}**（建議輸入更完整名稱，或改用英文）`);
-      }
-      return interaction.editReply('❌ 查詢失敗，請稍後再試');
+    if (!data.listings || data.listings.length === 0) {
+      return interaction.editReply('⚠️ 目前市場沒有上架資料');
     }
+
+    const prices = data.listings.map(l => l.pricePerUnit);
+    const min = Math.min(...prices);
+    const avg = Math.round(prices.reduce((a, b) => a + b, 0) / prices.length);
 
     const embed = new EmbedBuilder()
-      .setTitle(`📦 ${r.itemName}`)
-      .setDescription(`範圍：**${r.dc}（繁中服）** ｜ Item ID：\`${r.itemId}\``)
-      .addFields({
-        name: '最低單價（全繁中服）',
-        value: r.lowest
-          ? `${r.lowest.toLocaleString()} Gil${r.cheapestWorld ? `（最便宜：**${r.cheapestWorld}**）` : ''}`
-          : '（無掛單）',
-        inline: false,
-      })
-      .addFields({
-        name: '平均單價',
-        value: r.avg ? `${r.avg.toLocaleString()} Gil` : '（無資料）',
-        inline: true,
-      });
-
-    if (r.lastSale) {
-      const ts = r.lastSale.timestamp ? `<t:${r.lastSale.timestamp}:R>` : '';
-      embed.addFields({
-        name: '最近成交',
-        value: `${r.lastSale.pricePerUnit.toLocaleString()} Gil × ${r.lastSale.quantity} ${ts}`.trim(),
-        inline: true,
-      });
-    } else {
-      embed.addFields({ name: '最近成交', value: '（無資料）', inline: true });
-    }
-
-    const foot = [];
-    foot.push(r.fromCache ? '⚡ 快取' : '🌐 即時');
-    if (r.sharedInflight) foot.push('併發合併');
-    foot.push('TTL 10 分鐘');
-    embed.setFooter({ text: foot.join(' ｜ ') });
+      .setTitle(`📦 ${name}`)
+      .setDescription(`資料中心：${CHAOS_CH_DATA_CENTER}`)
+      .addFields(
+        { name: '最低價', value: `${min.toLocaleString()} Gil`, inline: true },
+        { name: '平均價', value: `${avg.toLocaleString()} Gil`, inline: true },
+        {
+          name: '最近成交',
+          value: data.recentHistory?.[0]
+            ? `${data.recentHistory[0].pricePerUnit.toLocaleString()} Gil`
+            : '無',
+          inline: true
+        }
+      )
+      .setFooter({ text: '資料來源：Universalis' });
 
     await interaction.editReply({ embeds: [embed] });
+
   } catch (err) {
     console.error(err);
-    // editReply 也可能遇到 interaction 過期，避免再炸一次
-    try {
-      await interaction.editReply('❌ 查詢失敗，請稍後再試');
-    } catch (e) {
-      console.warn('⚠️ editReply failed:', e?.code || e);
-    }
+    await interaction.editReply('❌ 查詢失敗，請稍後再試');
   }
 });
 
-/**
- * ✅ 全域防炸：避免任何一次 API/互動錯誤把 bot 弄死
- */
-process.on('unhandledRejection', (err) => {
-  console.error('❌ unhandledRejection', err);
-});
-process.on('uncaughtException', (err) => {
-  console.error('❌ uncaughtException', err);
-});
-client.on('error', (err) => {
-  console.error('❌ client error', err);
-});
-
+/* ===============================
+   登入
+================================ */
 client.login(process.env.DISCORD_TOKEN);
