@@ -8,12 +8,14 @@ import fetch from 'node-fetch';
  * ===== Render Web Service 必須開 Port（保活用）=====
  */
 const port = process.env.PORT || 3000;
-http.createServer((req, res) => {
-  res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
-  res.end('ok');
-}).listen(port, () => {
-  console.log(`HTTP server listening on ${port}`);
-});
+http
+  .createServer((req, res) => {
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8' });
+    res.end('ok');
+  })
+  .listen(port, () => {
+    console.log(`HTTP server listening on ${port}`);
+  });
 
 /**
  * ===== 固定查「陸行鳥（繁中服）」=====
@@ -25,7 +27,7 @@ const TCHW_DC = '陸行鳥';
  * ===== 快取 & 併發去重 =====
  */
 const CACHE_TTL_MS = 10 * 60 * 1000; // 10 分鐘
-const cache = new Map();    // key -> { expiresAt, value }
+const cache = new Map(); // key -> { expiresAt, value }
 const inflight = new Map(); // key -> Promise
 
 function getCache(key) {
@@ -52,10 +54,8 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds] });
 const command = new SlashCommandBuilder()
   .setName('price')
   .setDescription('查詢 FF14 繁中服（陸行鳥）市場價格（Universalis）')
-  .addStringOption(opt =>
-    opt.setName('item')
-      .setDescription('物品名稱（中文/英文都可）')
-      .setRequired(true)
+  .addStringOption((opt) =>
+    opt.setName('item').setDescription('物品名稱（中文/英文都可）').setRequired(true)
   );
 
 /**
@@ -90,11 +90,11 @@ async function resolveItemIdByName(itemName) {
   const results = data?.results || [];
   if (!results.length) return null;
 
-  // 盡量挑「完全相符」(忽略空白/大小寫)，不然用第一筆
+  // 優先完全相符（忽略空白/大小寫），否則取第一筆
   const norm = (s) => (s || '').replace(/\s+/g, '').toLowerCase();
   const target = norm(q);
 
-  let best = results.find(r => norm(r.itemName) === target);
+  let best = results.find((r) => norm(r.itemName) === target);
   if (!best) best = results[0];
 
   return { itemId: best.itemId, itemName: best.itemName || q };
@@ -118,7 +118,6 @@ function computeStats(dcMarketJson) {
   const listings = Array.isArray(dcMarketJson.listings) ? dcMarketJson.listings : [];
   const history = Array.isArray(dcMarketJson.recentHistory) ? dcMarketJson.recentHistory : [];
 
-  // 最低價（Universalis listings 通常已依價排序）
   const lowestListing = listings.length ? listings[0] : null;
   const lowest = lowestListing?.pricePerUnit ?? null;
   const cheapestWorld = lowestListing?.worldName || lowestListing?.world || null;
@@ -126,10 +125,10 @@ function computeStats(dcMarketJson) {
   // 平均價：優先用最近成交 history（最多 20 筆），沒有再用掛單平均
   let avg = null;
   if (history.length) {
-    const units = history.map(h => h.pricePerUnit).filter(n => Number.isFinite(n));
+    const units = history.map((h) => h.pricePerUnit).filter((n) => Number.isFinite(n));
     if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
   } else if (listings.length) {
-    const units = listings.map(l => l.pricePerUnit).filter(n => Number.isFinite(n));
+    const units = listings.map((l) => l.pricePerUnit).filter((n) => Number.isFinite(n));
     if (units.length) avg = Math.round(units.reduce((a, b) => a + b, 0) / units.length);
   }
 
@@ -140,7 +139,7 @@ function computeStats(dcMarketJson) {
     lastSale = {
       pricePerUnit: h.pricePerUnit,
       quantity: h.quantity,
-      timestamp: h.timestamp
+      timestamp: h.timestamp,
     };
   }
 
@@ -174,7 +173,6 @@ async function queryTchwPrice(itemName) {
       itemId: resolved.itemId,
       itemName: resolved.itemName || itemName,
       ...stats,
-      // 上傳時間（可有可無）
       updated: market.lastUploadTime ? new Date(market.lastUploadTime).toISOString() : null,
     };
 
@@ -198,7 +196,13 @@ client.on('interactionCreate', async (interaction) => {
   if (!interaction.isChatInputCommand()) return;
   if (interaction.commandName !== 'price') return;
 
-  await interaction.deferReply();
+  // ✅ 防止 Unknown interaction (10062) 直接把程式炸掉
+  try {
+    await interaction.deferReply();
+  } catch (err) {
+    console.warn('⚠️ deferReply failed (likely unknown interaction):', err?.code || err);
+    return;
+  }
 
   const item = interaction.options.getString('item');
 
@@ -215,27 +219,25 @@ client.on('interactionCreate', async (interaction) => {
     const embed = new EmbedBuilder()
       .setTitle(`📦 ${r.itemName}`)
       .setDescription(`範圍：**${r.dc}（繁中服）** ｜ Item ID：\`${r.itemId}\``)
-      .addFields(
-        {
-          name: '最低單價（全繁中服）',
-          value: r.lowest
-            ? `${r.lowest.toLocaleString()} Gil${r.cheapestWorld ? `（最便宜：**${r.cheapestWorld}**）` : ''}`
-            : '（無掛單）',
-          inline: false
-        },
-        {
-          name: '平均單價',
-          value: r.avg ? `${r.avg.toLocaleString()} Gil` : '（無資料）',
-          inline: true
-        }
-      );
+      .addFields({
+        name: '最低單價（全繁中服）',
+        value: r.lowest
+          ? `${r.lowest.toLocaleString()} Gil${r.cheapestWorld ? `（最便宜：**${r.cheapestWorld}**）` : ''}`
+          : '（無掛單）',
+        inline: false,
+      })
+      .addFields({
+        name: '平均單價',
+        value: r.avg ? `${r.avg.toLocaleString()} Gil` : '（無資料）',
+        inline: true,
+      });
 
     if (r.lastSale) {
       const ts = r.lastSale.timestamp ? `<t:${r.lastSale.timestamp}:R>` : '';
       embed.addFields({
         name: '最近成交',
         value: `${r.lastSale.pricePerUnit.toLocaleString()} Gil × ${r.lastSale.quantity} ${ts}`.trim(),
-        inline: true
+        inline: true,
       });
     } else {
       embed.addFields({ name: '最近成交', value: '（無資料）', inline: true });
@@ -248,11 +250,28 @@ client.on('interactionCreate', async (interaction) => {
     embed.setFooter({ text: foot.join(' ｜ ') });
 
     await interaction.editReply({ embeds: [embed] });
-
   } catch (err) {
     console.error(err);
-    await interaction.editReply('❌ 查詢失敗，請稍後再試');
+    // editReply 也可能遇到 interaction 過期，避免再炸一次
+    try {
+      await interaction.editReply('❌ 查詢失敗，請稍後再試');
+    } catch (e) {
+      console.warn('⚠️ editReply failed:', e?.code || e);
+    }
   }
+});
+
+/**
+ * ✅ 全域防炸：避免任何一次 API/互動錯誤把 bot 弄死
+ */
+process.on('unhandledRejection', (err) => {
+  console.error('❌ unhandledRejection', err);
+});
+process.on('uncaughtException', (err) => {
+  console.error('❌ uncaughtException', err);
+});
+client.on('error', (err) => {
+  console.error('❌ client error', err);
 });
 
 client.login(process.env.DISCORD_TOKEN);
