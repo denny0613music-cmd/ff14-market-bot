@@ -7,7 +7,8 @@ import {
   GatewayIntentBits,
   SlashCommandBuilder,
   Routes,
-  EmbedBuilder
+  EmbedBuilder,
+  MessageFlags
 } from 'discord.js';
 import { REST } from '@discordjs/rest';
 
@@ -239,8 +240,12 @@ client.on('interactionCreate', async interaction => {
   if (interaction.commandName !== 'price') return;
 
   try {
+    // ✅ 一進來立刻 ACK（避免 3 秒逾時）
+    // 公開回覆：flags: 0
+    // 私人回覆（只有自己看得到）：flags: MessageFlags.Ephemeral
     if (!interaction.deferred && !interaction.replied) {
-      await interaction.deferReply({ ephemeral: false });
+      await interaction.deferReply({ flags: 0 });
+      // await interaction.deferReply({ flags: MessageFlags.Ephemeral });
     }
 
     const keyword = interaction.options.getString('item');
@@ -288,11 +293,15 @@ client.on('interactionCreate', async interaction => {
 
   } catch (err) {
     console.error('⚠️ interaction error:', err);
+
+    // ✅ 互動已過期（Unknown interaction），這時候再回覆只會再噴一次錯
+    if (err?.code === 10062) return;
+
     try {
       if (interaction.deferred || interaction.replied) {
         await interaction.editReply('❌ 查詢失敗，請再試一次');
       } else {
-        await interaction.reply('❌ 查詢失敗，請再試一次');
+        await interaction.reply({ content: '❌ 查詢失敗，請再試一次', flags: MessageFlags.Ephemeral });
       }
     } catch {}
   }
