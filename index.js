@@ -1,4 +1,4 @@
-import 'dotenv/config';
+import 'dotenv/config';  // 引入 dotenv 模組來加載 .env 文件
 import fs from 'fs';
 import http from 'http';
 import fetch from 'node-fetch';
@@ -8,11 +8,14 @@ import {
   SlashCommandBuilder,
   Routes,
   EmbedBuilder,
-  MessageFlags
+  MessageFlags,
+  ActionRowBuilder,
+  ButtonBuilder,
+  ButtonStyle
 } from 'discord.js';
 import { REST } from '@discordjs/rest';
 
-/* =====================
+/* ===================== 
    HTTP SERVER（Render 必要：一定要先開）
 ===================== */
 const PORT = process.env.PORT || 10000;
@@ -181,11 +184,26 @@ client.on('interactionCreate', async interaction => {
       return interaction.editReply(`❌ 找不到符合「${keyword}」的物品`);
     }
 
+    // 如果有多個匹配的物品，生成按鈕讓使用者選擇
     if (matches.length > 1) {
-      const list = matches.map((m, i) => `${i + 1}. ${m.raw} (ID:${m.id})`).join('\n');
-      return interaction.editReply(`🔎 找到多個物品，請輸入更完整名稱：\n${list}`);
+      const row = new ActionRowBuilder();
+      
+      matches.forEach((m, i) => {
+        row.addComponents(
+          new ButtonBuilder()
+            .setCustomId(`item_${m.id}`)
+            .setLabel(m.raw)
+            .setStyle(ButtonStyle.Primary)
+        );
+      });
+
+      return interaction.editReply({
+        content: `🔎 找到多個物品，請選擇你想查詢的物品：`,
+        components: [row],
+      });
     }
 
+    // 只有一個匹配項時，直接查價
     const item = matches[0];
     const price = await fetchPrice(item.id);
 
@@ -213,6 +231,26 @@ client.on('interactionCreate', async interaction => {
       }
     } catch {}
   }
+});
+
+// 處理使用者選擇的按鈕
+client.on('interactionCreate', async interaction => {
+  if (!interaction.isButton()) return; // 確保是按鈕事件
+
+  const itemId = interaction.customId.split('_')[1]; // 從 customId 中提取物品 ID
+  const price = await fetchPrice(itemId);
+
+  if (!price) return interaction.reply('❌ 沒有市場資料');
+
+  const embed = new EmbedBuilder()
+    .setTitle(`📦 ${interaction.label}`)
+    .addFields(
+      { name: '最低價', value: `${price.min.toLocaleString()} Gil`, inline: true },
+      { name: '平均價', value: `${price.avg.toLocaleString()} Gil`, inline: true },
+      { name: '最近成交', value: `${price.last.toLocaleString()} Gil`, inline: true }
+    );
+
+  await interaction.update({ content: '查詢結果如下：', embeds: [embed], components: [] });
 });
 
 /* =====================
